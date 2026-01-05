@@ -98,7 +98,7 @@ def get_crop_base(image_size, label_type=str):
         image = image[y_add:y_add+patch_size, x_add:x_add+patch_size]
     '''
 
-    ratio = image_size // 3841
+    ratio = image_size // 384
     
     if label_type.lower() == 'asos':
         x_base = (900 - 384) / 2 + 75

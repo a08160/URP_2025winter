@@ -1,4 +1,0 @@
-type,threshold,label,csi,acc,auroc
-asos,0.25,AM,0.5516,0.9278,0.9512
-asos,0.25,mean,0.5516,0.9278,0.9512
-aafos,0.25,mean,nan,nan,nan
