@@ -37,7 +37,7 @@ class Met2NetFrostStage(nn.Module):
         super().__init__()
         
         # Lazy import to avoid circular dependency
-        from simvp_met2net import Met2Net_Model
+        from met2.simvp_met2net import Met2Net_Model
         
         self.backbone = Met2Net_Model(in_shape=in_shape, **met_kwargs)
         

@@ -29,7 +29,7 @@ from sklearn.metrics import roc_auc_score, confusion_matrix
 
 # Local imports
 from utils.gk2a_dataset_stage import GK2ADataset_stage
-from met2net_frost_stage import Met2NetFrostStage
+from met2.met2net_frost_stage import Met2NetFrostStage
 
 
 def set_seed(seed):
