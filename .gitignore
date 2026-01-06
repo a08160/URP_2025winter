@@ -2,6 +2,8 @@
 .vscode/
 results/
 __pycache__/
+models/__pycache__/
+utils/__pycache__/
 *.pyc
 .DS_Store
 .env
