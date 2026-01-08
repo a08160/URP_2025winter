@@ -210,12 +210,39 @@ class GK2ADataset(Dataset):
             for image_date in image_date_list:
                 image_path = os.path.join(self.data_path, image_date[0:8], f'{self.channels}_{image_date}.npy')
                 image = np.load(image_path).astype(np.float32)
-                
-                image = np.expand_dims(image, axis=0) if len(image.shape) == 2 else image # H,W -> C,H,W
-                image = np.transpose(image, (1,2,0)) 
 
-                image = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_CUBIC)
-                image = np.transpose(image, (2,0,1))
+                image = np.expand_dims(image, axis=0) if len(image.shape) == 2 else image # H,W -> C,H,W
+
+                # 512x512 원본 이미지 처리:
+                # - image_size=512: 그대로 사용
+                # - image_size=384: 512에서 (64,64) offset으로 384x384 crop
+                # - image_size=192: 384x384 crop 후 192x192로 resize
+                CROP_BASE = 64
+                CROP_SIZE_384 = 384
+
+                if image.shape[1] == 512 and image.shape[2] == 512:
+                    if self.image_size == 512:
+                        # 512x512 그대로 사용
+                        pass
+                    elif self.image_size == 384:
+                        # 512 -> 384 crop
+                        image = image[:, CROP_BASE:CROP_BASE+CROP_SIZE_384, CROP_BASE:CROP_BASE+CROP_SIZE_384]
+                    elif self.image_size == 192:
+                        # 512 -> 384 crop -> 192 resize
+                        image = image[:, CROP_BASE:CROP_BASE+CROP_SIZE_384, CROP_BASE:CROP_BASE+CROP_SIZE_384]
+                        image = np.transpose(image, (1,2,0))  # C,H,W -> H,W,C
+                        image = cv2.resize(image, (192, 192), interpolation=cv2.INTER_AREA)
+                        image = np.transpose(image, (2,0,1))  # H,W,C -> C,H,W
+                    else:
+                        # 다른 크기: 512에서 직접 resize
+                        image = np.transpose(image, (1,2,0))
+                        image = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_CUBIC)
+                        image = np.transpose(image, (2,0,1))
+                elif image.shape[1] != self.image_size or image.shape[2] != self.image_size:
+                    # 512가 아닌 다른 크기의 이미지는 직접 resize
+                    image = np.transpose(image, (1,2,0))
+                    image = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_CUBIC)
+                    image = np.transpose(image, (2,0,1))
 
                 if self.calib is not None:
                     for i, channel in enumerate(self.calib):

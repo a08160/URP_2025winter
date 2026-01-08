@@ -98,18 +98,24 @@ def get_crop_base(image_size, label_type=str):
     데이터 경로:
         - 512x512: 900에서 직접 crop
         - 384x384: 512에서 (64,64) offset으로 crop (900 -> 512 -> 384)
+        - 192x192: 384를 resize (900 -> 512 -> 384 -> 192)
 
     예시:
         x_base, y_base, crop_size = get_crop_base(image_size=384, label_type='asos')
         asos_map = {k: coord_to_map(*v, 900) for k, v in ASOS_COORD.items()}
         asos_map = {k: (v[0]-x_base, v[1]-y_base) for k, v in asos_map.items()}
 
+        # 192의 경우 추가로 2로 나눠야 함:
+        x_base, y_base, crop_size = get_crop_base(image_size=192, label_type='asos')
+        asos_map = {k: coord_to_map(*v, 900) for k, v in ASOS_COORD.items()}
+        asos_map = {k: ((v[0]-x_base)//2, (v[1]-y_base)//2) for k, v in asos_map.items()}
+
     Parameters:
-        image_size: target crop size (384 or 512)
+        image_size: target crop size (192, 384 or 512)
         label_type: 'asos' or 'aafos'
 
     Returns:
-        x_base, y_base: 900 기준 crop offset
+        x_base, y_base: 900 기준 crop offset (384 기준, 192는 좌표 계산시 //2 필요)
         crop_size: crop size (aafos는 절반)
     '''
     # 512x512 crop에서 384x384로 추가 crop 시 offset
@@ -117,8 +123,8 @@ def get_crop_base(image_size, label_type=str):
 
     if label_type.lower() == 'asos':
         # 기본 offset (관측소 중심 맞춤): x=75, y=115
-        if image_size == 384:
-            # 900 -> 512 -> 384 경로
+        if image_size == 384 or image_size == 192:
+            # 900 -> 512 -> 384 경로 (192는 384를 resize)
             # 900->512 base: (900-512)/2 + offset = 194 + 75 = 269, 194 + 115 = 309
             # 512->384 crop offset: 64
             # 최종: 269 + 64 = 333, 309 + 64 = 373
@@ -132,7 +138,7 @@ def get_crop_base(image_size, label_type=str):
 
     elif label_type.lower() == 'aafos':
         # AAFOS는 더 작은 영역 (192x192 기준)
-        if image_size == 384:
+        if image_size == 384 or image_size == 192:
             x_base = (900 - 192) / 2 + 100 + CROP_OFFSET_384
             y_base = (900 - 192) / 2 + 20 + CROP_OFFSET_384
         else:
@@ -153,7 +159,7 @@ def get_station_map(image_size, label_type='asos', origin_size=900):
     이 방식은 verify_crop_384.ipynb에서 검증된 방식입니다.
 
     Parameters:
-        image_size: 타겟 이미지 크기 (384, 512 등)
+        image_size: 타겟 이미지 크기 (192, 384, 512 등)
         label_type: 'asos' or 'aafos'
         origin_size: 원본 이미지 크기 (기본값 900, 2km 해상도)
 
@@ -163,6 +169,8 @@ def get_station_map(image_size, label_type='asos', origin_size=900):
     Example:
         >>> asos_map = get_station_map(384, 'asos')
         >>> print(asos_map[93])  # (191, 78)
+        >>> asos_map_192 = get_station_map(192, 'asos')
+        >>> print(asos_map_192[93])  # (95, 39) - 384 좌표의 1/2
     '''
     # 512 기준 offset (관측소 중심 맞춤)
     OFFSET_512 = {
@@ -202,6 +210,12 @@ def get_station_map(image_size, label_type='asos', origin_size=900):
         # 512에서 (64, 64) offset으로 crop
         return {k: (v[0] - CROP_OFFSET_384, v[1] - CROP_OFFSET_384)
                 for k, v in map_512.items()}
+    elif image_size == 192:
+        # 384를 1/2로 downsize한 크기
+        # 384 좌표를 먼저 계산 후 2로 나눔
+        map_384 = {k: (v[0] - CROP_OFFSET_384, v[1] - CROP_OFFSET_384)
+                   for k, v in map_512.items()}
+        return {k: (v[0] // 2, v[1] // 2) for k, v in map_384.items()}
     else:
         # 다른 크기: 512 중심 기준으로 계산
         offset = (512 - image_size) // 2
