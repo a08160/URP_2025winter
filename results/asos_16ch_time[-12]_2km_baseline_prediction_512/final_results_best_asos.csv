@@ -1,0 +1,7 @@
+type,threshold,label,csi,acc,auroc
+asos,0.25,AM,0.5396,0.9228,0.9494
+asos,0.25,mean,0.5396,0.9228,0.9494
+asos_land,0.25,AM,0.6000,0.8948,0.9535
+asos_land,0.25,mean,0.6000,0.8948,0.9535
+asos_coast,0.25,AM,0.3580,0.9485,0.9136
+asos_coast,0.25,mean,0.3580,0.9485,0.9136
