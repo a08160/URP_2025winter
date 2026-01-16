@@ -3,17 +3,18 @@ try:
     from .modeling import _load_model
     from .convlstm import ConvLSTM
     from .PredFormer_Binary_ST import PredFormer_Model
+    from .backbone.resnet import resnet18
 except:
     from _deeplab import DeepLabHeadV3Plus
     from modeling import _load_model
     from convlstm import ConvLSTM
     from PredFormer_Binary_ST import PredFormer_Model
+    from backbone.resnet import resnet18
 
 import torch
 import torch.nn as nn
 import math
 
-# [추가] ConvLSTM을 Segmentation 모델처럼 동작하게 하는 래퍼 클래스 정의
 class ConvLSTMSegmentation(nn.Module):
     def __init__(self, in_channels, hidden_dim, num_layers, num_classes, 
                  num_frames, misc_channels=0, kernel_size=(3, 3)):
@@ -27,10 +28,10 @@ class ConvLSTMSegmentation(nn.Module):
         
         self.num_frames = num_frames
         self.misc_channels = misc_channels
-        self.dynamic_channels_per_frame = in_channels - misc_channels
+        self.dynamic_channels_per_frame = (in_channels - misc_channels) // num_frames
 
-        # ConvLSTM 초기화
-        self.convlstm = ConvLSTM(input_dim=in_channels, # 여기는 (Dynamic + Misc) 합산 채널이 들어갑니다.
+        # ConvLSTM 초기화: 각 타임스텝당 채널 수 = dynamic_channels_per_frame + misc_channels
+        self.convlstm = ConvLSTM(input_dim=self.dynamic_channels_per_frame + misc_channels,
                                  hidden_dim=hidden_dim,
                                  kernel_size=kernel_size,
                                  num_layers=num_layers,
@@ -162,22 +163,220 @@ class PredFormerSegmentation(nn.Module):
         return out
 
 
+class ResNetConvLSTMSegmentation(nn.Module):
+    """
+    ResNet18 backbone으로 feature extraction 후 ConvLSTM에 입력하는 모델
+    - 각 timestep마다 ResNet18으로 feature 추출
+    - Feature sequence를 ConvLSTM으로 temporal modeling
+    - Decoder로 원래 해상도 복원
 
-def get_model(n_channel, patch_size, class_num=2, model_type='deeplab'):
+    Sliding Window 모드:
+    - window_size > 1이면 여러 timestep을 묶어서 하나의 프레임으로 처리
+    - stride로 윈도우 이동 간격 조절 (overlap 가능)
+    """
+    def __init__(self, in_channels, hidden_dim, num_layers, num_classes,
+                 num_timesteps, misc_channels=0, kernel_size=(3, 3),
+                 pretrained=True, feature_layer='layer3',
+                 window_size=1, stride=1):
+        """
+        Args:
+            in_channels: 전체 입력 채널 수 (Dynamic * Time + Static)
+            hidden_dim: ConvLSTM hidden dimension
+            num_layers: ConvLSTM layer 수
+            num_classes: 출력 클래스 수
+            num_timesteps: 원본 시계열 데이터의 timestep 수 (예: time_range 길이)
+            misc_channels: Static 채널 수
+            kernel_size: ConvLSTM kernel size
+            pretrained: ImageNet pretrained weights 사용 여부
+            feature_layer: feature 추출할 layer ('layer2', 'layer3', 'layer4')
+            window_size: 각 프레임이 포함하는 timestep 수 (기본 1 = 개별 처리)
+            stride: 윈도우 이동 간격 (기본 1, stride < window_size면 overlap)
+        """
+        super(ResNetConvLSTMSegmentation, self).__init__()
+
+        self.num_timesteps = num_timesteps
+        self.misc_channels = misc_channels
+        self.window_size = window_size
+        self.stride = stride
+        self.feature_layer = feature_layer
+
+        # 원본 timestep당 채널 수
+        self.channels_per_timestep = (in_channels - misc_channels) // num_timesteps
+
+        # Sliding window로 생성되는 프레임 수
+        self.num_frames = (num_timesteps - window_size) // stride + 1
+
+        # 각 프레임(윈도우)의 채널 수
+        self.channels_per_frame = self.channels_per_timestep * window_size
+
+        # Feature dimension 및 scale factor 설정
+        feature_dims = {'layer2': 128, 'layer3': 256, 'layer4': 512}
+        scale_factors = {'layer2': 8, 'layer3': 16, 'layer4': 32}
+        self.feature_dim = feature_dims[feature_layer]
+        self.scale_factor = scale_factors[feature_layer]
+
+        # ResNet18 backbone 로드
+        backbone = resnet18(pretrained=pretrained)
+
+        # 입력 채널 수 변경 (윈도우 내 dynamic 채널 + static 채널)
+        backbone_input_channels = self.channels_per_frame + misc_channels
+        self.backbone_conv1 = nn.Conv2d(backbone_input_channels, 64,
+                                         kernel_size=7, stride=2, padding=3, bias=False)
+        self.backbone_bn1 = backbone.bn1
+        self.backbone_relu = backbone.relu
+        self.backbone_maxpool = backbone.maxpool
+        self.backbone_layer1 = backbone.layer1
+        self.backbone_layer2 = backbone.layer2
+
+        if feature_layer in ['layer3', 'layer4']:
+            self.backbone_layer3 = backbone.layer3
+        if feature_layer == 'layer4':
+            self.backbone_layer4 = backbone.layer4
+
+        # ConvLSTM: feature dimension을 입력으로 받음
+        self.convlstm = ConvLSTM(
+            input_dim=self.feature_dim,
+            hidden_dim=hidden_dim,
+            kernel_size=kernel_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bias=True,
+            return_all_layers=False
+        )
+
+        # Decoder: Upsampling + Classification
+        self.decoder = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
+        )
+
+        # Upsampling은 forward에서 동적으로 처리 (입력 크기에 맞춤)
+
+    def extract_features(self, x):
+        """단일 프레임에서 feature 추출"""
+        x = self.backbone_conv1(x)
+        x = self.backbone_bn1(x)
+        x = self.backbone_relu(x)
+        x = self.backbone_maxpool(x)
+
+        x = self.backbone_layer1(x)
+        x = self.backbone_layer2(x)
+
+        if self.feature_layer in ['layer3', 'layer4']:
+            x = self.backbone_layer3(x)
+        if self.feature_layer == 'layer4':
+            x = self.backbone_layer4(x)
+
+        return x
+
+    def forward(self, x):
+        # x: (B, Total_Channels, H, W)
+        b, _, h, w = x.size()
+
+        # 1. 데이터 분리 (Dynamic vs Static)
+        if self.misc_channels > 0:
+            dynamic_x = x[:, :-self.misc_channels, :, :]
+            static_x = x[:, -self.misc_channels:, :, :]
+        else:
+            dynamic_x = x
+            static_x = None
+
+        # 2. Dynamic Data Reshape: (B, T*C, H, W) -> (B, T, C, H, W)
+        #    T = num_timesteps (원본 timestep 수)
+        #    C = channels_per_timestep (timestep당 채널 수)
+        dynamic_x = dynamic_x.view(b, self.num_timesteps, self.channels_per_timestep, h, w)
+
+        # 3. Sliding Window로 각 프레임 생성 및 feature extraction
+        features = []
+        for f in range(self.num_frames):
+            # 윈도우 시작 timestep
+            start_t = f * self.stride
+            # 윈도우 내 timestep들의 채널을 concat
+            window_timesteps = dynamic_x[:, start_t:start_t + self.window_size, :, :, :]  # (B, window_size, C, H, W)
+            # (B, window_size, C, H, W) -> (B, window_size * C, H, W)
+            frame = window_timesteps.reshape(b, self.channels_per_frame, h, w)
+
+            # Static 채널 결합
+            if static_x is not None:
+                frame = torch.cat([frame, static_x], dim=1)
+
+            # ResNet backbone으로 feature 추출
+            feat = self.extract_features(frame)  # (B, feat_dim, H', W')
+            features.append(feat)
+
+        # 4. Feature sequence 생성: (B, T, feat_dim, H', W')
+        feature_seq = torch.stack(features, dim=1)
+
+        # 5. ConvLSTM 실행
+        _, last_states = self.convlstm(feature_seq)
+        h_out = last_states[-1][0]  # (B, hidden_dim, H', W')
+
+        # 6. Decoder
+        out = self.decoder(h_out)
+
+        # 7. 원래 해상도로 Upsample
+        out = nn.functional.interpolate(out, size=(h, w), mode='bilinear', align_corners=False)
+
+        return out
+
+
+def get_model(n_channel, patch_size, class_num=2, model_type='deeplab', misc_channels=3,
+              channels_per_timestep=16, window_size=2, stride=1):
     """
     Args:
         n_channel: 전체 입력 채널 수
         patch_size: 패치 크기
         class_num: 출력 클래스 수
-        model_type: 'deeplab', 'convlstm', 'predformer'
+        model_type: 'deeplab', 'convlstm', 'predformer', 'resnet_convlstm'
+        misc_channels: Static 채널 수 (elevation, vegetation, watermap 등)
+        channels_per_timestep: 한 timestep당 채널 수 (16ch 데이터 기준 16)
+        window_size: Sliding window 크기 (기본 2 = 개별 timestep 처리)
+        stride: Sliding window 이동 간격 (기본 1)
+
+    Examples:
+        time_range = [-18, -15, -12] (3 timesteps), window_size=1, stride=1
+          → 3 frames, 각 19채널 (16 + 3 misc)
+
+        time_range = [-21, -18, -15, -12] (4 timesteps), window_size=2, stride=1
+          → 3 frames (overlap), 각 35채널 (32 + 3 misc)
+          → Frame 0: t=-21, t=-18
+          → Frame 1: t=-18, t=-15 (overlap)
+          → Frame 2: t=-15, t=-12 (overlap)
+
+        time_range = [-27, ..., -12] (6 timesteps), window_size=2, stride=2
+          → 3 frames (no overlap), 각 35채널
+          → Frame 0: t=-27, t=-24
+          → Frame 1: t=-21, t=-18
+          → Frame 2: t=-15, t=-12
     """
 
-    num_frames = 3
-    misc_channels = 3
-    dynamic_total = n_channel - misc_channels
-    channels_per_frame = (dynamic_total // num_frames) + misc_channels
+    # 원본 timestep 수 계산
+    num_timesteps = (n_channel - misc_channels) // channels_per_timestep
 
-    if model_type == 'convlstm':
+    # ConvLSTM/PredFormer용 num_frames 계산 (sliding window 적용 전)
+    num_frames = (num_timesteps - window_size) // stride + 1
+    channels_per_frame = channels_per_timestep * window_size + misc_channels
+
+    if model_type == 'resnet_convlstm':
+        hidden_dim = 64
+        num_layers = 2
+
+        model = ResNetConvLSTMSegmentation(
+            in_channels=n_channel,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_classes=class_num,
+            num_timesteps=num_timesteps,
+            misc_channels=misc_channels,
+            pretrained=True,
+            feature_layer='layer3',
+            window_size=window_size,
+            stride=stride
+        )
+
+    elif model_type == 'convlstm':
         hidden_dim = 64
         num_layers = 2
 
@@ -206,13 +405,13 @@ def get_model(n_channel, patch_size, class_num=2, model_type='deeplab'):
         
     elif model_type == 'deeplab':
         model = _load_model('deeplabv3plus', 'resnet18', 1, output_stride=None, pretrained_backbone=True)
-        model.backbone.conv1 = nn.Conv2d(n_channel, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        model.backbone.conv1 = nn.Conv2d(n_channel, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False) # 거의 1/2 압축
         model.classifier = DeepLabHeadV3Plus(in_channels=512, low_level_channels=64, num_classes=1, aspp_dilate=[6, 12, 18])
         model.classifier.classifier = nn.Conv2d(112, class_num, 3, 1, 1)
         model.cuda()
 
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Choose 'convlstm' or 'predformer'.")
+        raise ValueError(f"Unknown model_type: {model_type}. Choose 'deeplab', 'convlstm', 'predformer', or 'resnet_convlstm'.")
 
     model.cuda()
 
